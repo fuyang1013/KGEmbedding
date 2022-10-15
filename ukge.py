@@ -3,12 +3,15 @@ author: flyangovoyang@163.com
 first create: 2022-10-15
 last updated: 2022-10-15
 """
+from calendar import c
 import os
+import pdb
 from argparse import ArgumentParser
 import logging
+import numpy as np
 import time
 import torch
-from torch import Tensor, e, sigmoid, pow
+from torch import sigmoid, pow
 from torch.utils.data import TensorDataset, RandomSampler, SequentialSampler, DataLoader
 
 
@@ -54,8 +57,8 @@ class UKGE(torch.nn.Module):
         super().__init__()
         self.ent_emb = torch.nn.Embedding(num_ents, num_dim)
         self.rel_emb = torch.nn.Embedding(num_rels, num_dim)
-        self.w = torch.nn.Parameter(torch.FloatTensor(0))
-        self.b = torch.nn.Parameter(torch.FloatTensor(0))
+        self.w = torch.nn.Parameter(torch.FloatTensor([0]))
+        self.b = torch.nn.Parameter(torch.FloatTensor([0]))
         assert mapping == 'logistic' or mapping == 'bounded_rectifier'
         if mapping == 'logistic':
             self.score_function = self.logistic
@@ -63,7 +66,7 @@ class UKGE(torch.nn.Module):
             self.score_function = self.bounded_rectifier
     
     def logistic(self, x):
-        return torch.div(1, 1 + pow(e,  - (self.w * x + self.b)))
+        return torch.div(1, 1 + pow(np.e,  - (self.w * x + self.b)))
     
     def bounded_rectifier(self, x):
         return torch.min(torch.max(self.w * x + self.b, 0), 1)
@@ -77,21 +80,24 @@ class UKGE(torch.nn.Module):
         return:
             score: float
         """
-        
+        h = self.ent_emb(h)
+        t = self.ent_emb(t)
+        r = self.rel_emb(r)
+
         x = (h * t * r).sum(dim=-1)
         preds = self.score_function(x)
         if r is not None:
             loss = loss_function(preds, scores)
             return preds, loss
         return preds
-    
 
-def read_file(infile, num_examples=None):
+
+def read_file(infile, num_examples=None, verbose=False):
     examples = []
     for line in open(infile):
         ll = line.rstrip().split('\t')
         h, r, t, s = ll
-        h = int(h), int(r), int(t), float(s)
+        h, r, t, s = int(h), int(r), int(t), float(s)
         triplet = Triplet(h, r, t)
         examples.append(Example(triplet, s))
 
@@ -104,7 +110,7 @@ def build_dataloader(examples, batch_size, sample='random'):
     heads = torch.LongTensor([x.triplet.h for x in examples])
     tails = torch.LongTensor([x.triplet.t for x in examples])
     relations = torch.LongTensor([x.triplet.r for x in examples])
-    scores = torch.FloatTensor([x.triplet.score for x in examples])
+    scores = torch.FloatTensor([x.score for x in examples])
     dataset = TensorDataset(heads, relations, tails, scores)
     sampler = RandomSampler(dataset) if sample == 'random' else SequentialSampler(dataset)
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
@@ -138,27 +144,30 @@ def train(model: UKGE, args):
     logging.info(f'train examples: {len(train_examples)}, eval_examples: {len(eval_examples)}')
 
     global_steps = 0
+    logging.info('start to train...')
     for epoch in range(args.train_epochs):
         for batch in train_dataloader:
+            global_steps += 1
             optimizer.zero_grad()
             heads, relations, tails, scores = tuple([t.to(device) for t in batch])
             _, loss = model(h=heads, r=relations, t=tails, scores=scores)
-            loss.backwards()
+            loss.backward()
             optimizer.step()
 
             if (global_steps + 1) % args.display_steps == 0 or (global_steps + 1) % len(train_dataloader) == 0 or args.debug:
                 logging.info(f'epoch={epoch}, steps={global_steps}, loss={loss.item():.4f}')
         
         logging.info('evaluating...')
-        eval_loss = evaluate(model, eval_dataloader, verbose=False)
+        eval_loss = evaluate(model, eval_dataloader, args, verbose=False)
         logging.info(f'epoch={epoch}, mse={eval_loss:.4f}')
+        
+        save_model_name = f'{args.save_model_name}-epoch-{epoch}-mse-{eval_loss:.4f}'
+        if not os.path.exists(os.path.join(args.save_model_dir, save_model_name)):
+            os.mkdir(os.path.join(args.save_model_dir, save_model_name))
 
-        if os.path.exists(os.path.join(args.save_model_dir, args.save_model_name)):
-            os.mkdir(os.path.join(args.save_model_dir, args.save_model_name))
-
-        save_model_path = os.path.join(args.save_model_dir, args.save_model_name, 'model.pt')
+        save_model_path = os.path.join(args.save_model_dir, save_model_name, 'model.pt')
         torch.save(model.state_dict(), save_model_path)
-        open(os.path.join(args.save_model_dir, args.save_model_name, 'config.json'), 'w').write(str(args))
+        open(os.path.join(args.save_model_dir, save_model_name, 'config.json'), 'w').write(str(args))
 
         if args.debug:
             break
@@ -183,9 +192,9 @@ if __name__ == '__main__':
     parser.add_argument('--do_eval', action='store_true')
     parser.add_argument('--save_model_dir', type=str, default='model_save')
     parser.add_argument('--save_model_name', type=str, default=time.strftime('%m%d_%H%M%S', time.localtime()))
-    parser.add_argument('--lr', type=str)
+    parser.add_argument('--lr', type=float)
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--display_steps', type=int, default=50)
+    parser.add_argument('--display_steps', type=int, default=200)
     parser.add_argument('--train_file', type=str)
     parser.add_argument('--eval_file', type=str)
     parser.add_argument('--checkpoint', type=str)
@@ -202,7 +211,7 @@ if __name__ == '__main__':
         num_examples = 200 if args.debug else None
         eval_examples = read_file(args.eval_file, num_examples)
         eval_dataloader = build_dataloader(eval_examples, args.batch_size, 'sequential')
-        evaluate(model, eval_dataloader, args, verbose=True)
+        print(evaluate(model, eval_dataloader, args, verbose=True))
     else:
         logging.info('unknown task')
 
